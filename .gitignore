@@ -1,0 +1,25 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual env
+.venv/
+venv/
+
+# Runtime / logs
+*.log
+
+# Scraping/export artifacts
+exports/
+docs/image/
+
+# Session / credential-like local files
+medium_state.json
+cookies.json
+*.cookies.json
