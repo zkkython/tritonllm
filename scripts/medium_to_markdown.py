@@ -14,6 +14,7 @@ import hashlib
 import json
 import mimetypes
 import re
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -218,6 +219,47 @@ def download_images(soup: BeautifulSoup, page_url: str, assets_dir: Path, retrie
 
 
 def extract_code_text(pre: Tag) -> str:
+    def normalize_code_text(text: str) -> str:
+        # Keep indentation meaningful while removing common extraction artifacts.
+        text = (
+            text.replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .replace("\u00a0", " ")  # nbsp -> space
+            .replace("\u200b", "")   # zero-width space
+        )
+        lines = text.split("\n")
+
+        # Heuristic: some embeds become "line + empty line + line + empty line".
+        if len(lines) >= 6:
+            odd = lines[1::2]
+            even = lines[0::2]
+            odd_blank_ratio = (
+                sum(1 for ln in odd if ln.strip() == "") / max(1, len(odd))
+            )
+            even_nonblank_ratio = (
+                sum(1 for ln in even if ln.strip() != "") / max(1, len(even))
+            )
+            if odd_blank_ratio > 0.85 and even_nonblank_ratio > 0.6:
+                lines = even
+
+        # Trim right side only; preserve leading spaces for Python indentation.
+        lines = [ln.rstrip(" \t") for ln in lines]
+
+        # Heuristic for certain GitHub embeds: indentation level collapses to 1 space.
+        # If most indented lines start with exactly one leading space, expand it to 4.
+        indented = [ln for ln in lines if ln.startswith(" ") and ln.strip()]
+        if indented:
+            one_space_ratio = (
+                sum(1 for ln in indented if len(ln) > 1 and ln[0] == " " and (len(ln) == 1 or ln[1] != " "))
+                / len(indented)
+            )
+            if one_space_ratio > 0.75:
+                lines = [("    " + ln[1:]) if (ln.startswith(" ") and (len(ln) == 1 or ln[1] != " ")) else ln for ln in lines]
+
+        text = "\n".join(lines)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip("\n")
+        return text
+
     code_node = pre.find("code") or pre
 
     # 1) Prefer explicit line wrappers used by many syntax highlighters.
@@ -227,7 +269,7 @@ def extract_code_text(pre: Tag) -> str:
     if len(line_nodes) >= 2:
         lines = [ln.get_text("", strip=False).rstrip("\n\r") for ln in line_nodes]
         text = "\n".join(lines)
-        text = re.sub(r"\n{3,}", "\n\n", text).strip("\n")
+        text = normalize_code_text(text)
         if text:
             return text
 
@@ -246,15 +288,96 @@ def extract_code_text(pre: Tag) -> str:
 
     text = "".join(parts).replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text).strip("\n")
+    text = normalize_code_text(text)
     if text:
         return text
 
     # 3) Fallback.
-    return code_node.get_text("", strip=False).replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+    return normalize_code_text(code_node.get_text("", strip=False))
 
 
-def preserve_math_and_code(soup: BeautifulSoup, code_mode: str = "fenced") -> Tuple[BeautifulSoup, List[Tuple[str, str]]]:
+def render_code_block(code_text: str, code_mode: str = "fenced", lang: str = "") -> str:
+    if code_mode == "html":
+        esc = (
+            code_text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        class_attr = f' class="language-{lang}"' if lang else ""
+        return f"<pre><code{class_attr}>{esc}</code></pre>"
+    return f"```{lang}\n{code_text}\n```"
+
+
+def extract_embed_code_from_html(html: str, retries: int = 3) -> str:
+    """Best-effort extraction for code embeds (gist/medium media/etc.)."""
+    s = BeautifulSoup(html, "html.parser")
+
+    # 0) Prefer raw-source links when present (best fidelity for indentation).
+    raw_candidates: List[str] = []
+    for a in s.find_all("a"):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        txt = a.get_text(" ", strip=True).lower()
+        h = href.lower()
+        if (
+            "raw.githubusercontent.com" in h
+            or "/raw/" in h
+            or ("gist.github.com" in h and "raw" in h)
+            or txt == "view raw"
+            or "view raw" in txt
+        ):
+            raw_candidates.append(href)
+
+    seen_raw: set[str] = set()
+    for href in raw_candidates:
+        if href in seen_raw:
+            continue
+        seen_raw.add(href)
+        resp = fetch_with_retries(href, retries=retries, timeout_s=20)
+        if resp is None:
+            continue
+        ctype = (resp.headers.get("content-type") or "").lower()
+        text = resp.text.replace("\r\n", "\n").replace("\r", "\n")
+        # Skip HTML wrappers unless explicitly text/plain.
+        if "<html" in text[:300].lower() and "text/plain" not in ctype:
+            continue
+        if text.count("\n") >= 3:
+            return text.strip("\n")
+
+    # 1) Standard code blocks.
+    chunks: List[str] = []
+    for pre in s.find_all("pre"):
+        txt = extract_code_text(pre)
+        if txt:
+            chunks.append(txt)
+    if chunks:
+        return "\n\n".join(chunks).strip()
+
+    # 2) GitHub/Gist-like line wrappers.
+    line_nodes = s.select(".blob-code, .js-file-line, .line, [data-line-number]")
+    if len(line_nodes) >= 2:
+        lines = [
+            ln.get_text("", strip=False)
+            .replace("\u00a0", " ")
+            .replace("\u200b", "")
+            .rstrip("\n\r")
+            for ln in line_nodes
+        ]
+        text = "\n".join(lines)
+        text = re.sub(r"\n{3,}", "\n\n", text).strip("\n")
+        if text:
+            return text
+
+    return ""
+
+
+def preserve_math_and_code(
+    soup: BeautifulSoup,
+    code_mode: str = "fenced",
+    page_url: str | None = None,
+    retries: int = 3,
+) -> Tuple[BeautifulSoup, List[Tuple[str, str]]]:
     placeholders: List[Tuple[str, str]] = []
 
     def add_placeholder(md_snippet: str) -> str:
@@ -282,6 +405,31 @@ def preserve_math_and_code(soup: BeautifulSoup, code_mode: str = "fenced") -> Tu
         md = f"$$\n{expr}\n$$" if display_parent else f"${expr}$"
         katex.replace_with(add_placeholder(md))
 
+    # Handle embedded code iframes (e.g. medium.com/media/* embeds from GitHub gist).
+    for iframe in soup.find_all("iframe"):
+        raw_src = iframe.get("src")
+        if not raw_src:
+            iframe.decompose()
+            continue
+
+        src = urljoin(page_url, raw_src) if page_url else raw_src
+        title = (iframe.get("title") or "Embedded content").strip()
+        md = ""
+
+        # Try to fetch and inline actual code content.
+        resp = fetch_with_retries(src, retries=retries, timeout_s=20)
+        if resp is not None and resp.text:
+            embed_code = extract_embed_code_from_html(resp.text, retries=retries)
+            if embed_code:
+                heading = f"**{title}**\n\n" if title else ""
+                md = heading + render_code_block(embed_code, code_mode=code_mode)
+
+        # Fallback: keep a link so embeds are never silently dropped.
+        if not md:
+            md = f"[{title}]({src})"
+
+        iframe.replace_with(add_placeholder(md))
+
     for pre in soup.find_all("pre"):
         code_text = extract_code_text(pre)
         if not code_text:
@@ -302,28 +450,33 @@ def preserve_math_and_code(soup: BeautifulSoup, code_mode: str = "fenced") -> Tu
                 lang = m.group(1)
                 break
 
-        if code_mode == "html":
-            esc = (
-                code_text.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-            )
-            class_attr = f' class="language-{lang}"' if lang else ""
-            md = f"<pre><code{class_attr}>{esc}</code></pre>"
-        else:
-            md = f"```{lang}\n{code_text}\n```"
+        md = render_code_block(code_text, code_mode=code_mode, lang=lang)
         pre.replace_with(add_placeholder(md))
 
     return soup, placeholders
 
 
-def to_markdown(html: str, code_mode: str = "fenced") -> str:
+def to_markdown(
+    html: str,
+    code_mode: str = "fenced",
+    page_url: str | None = None,
+    retries: int = 3,
+) -> str:
     soup = BeautifulSoup(html, "html.parser")
 
-    for tag in soup(["style", "noscript", "iframe"]):
+    for tag in soup(["style", "noscript"]):
         tag.decompose()
 
-    soup, placeholders = preserve_math_and_code(soup, code_mode=code_mode)
+    soup, placeholders = preserve_math_and_code(
+        soup,
+        code_mode=code_mode,
+        page_url=page_url,
+        retries=retries,
+    )
+
+    # Any unprocessed iframes should not leak into markdown output.
+    for iframe in soup.find_all("iframe"):
+        iframe.decompose()
 
     md = html_to_md(
         str(soup),
@@ -481,6 +634,34 @@ def load_page_with_retries(
             time.sleep(min(8, 1.5 * (2**i)))
 
 
+def hydrate_page_content(page: Page, idle_timeout_ms: int) -> None:
+    """Best-effort hydration for lazy content (images/embeds/code cards)."""
+    dismiss_medium_popups(page)
+    try_wait_network_idle(page, timeout_ms=idle_timeout_ms)
+    try:
+        page.evaluate(
+            """
+            async () => {
+              let prev = -1;
+              for (let i = 0; i < 16; i++) {
+                const h = document.body ? document.body.scrollHeight : 0;
+                window.scrollBy(0, Math.max(800, window.innerHeight * 0.9));
+                await new Promise((r) => setTimeout(r, 260));
+                if (h === prev) {
+                  break;
+                }
+                prev = h;
+              }
+              window.scrollTo(0, 0);
+            }
+            """
+        )
+    except Exception:
+        pass
+    try_wait_network_idle(page, timeout_ms=min(idle_timeout_ms, 4000))
+    dismiss_medium_popups(page)
+
+
 def pick_page_from_context(context, target_url: str, use_existing_page: bool) -> Page:
     pages = context.pages
     if use_existing_page and pages:
@@ -496,6 +677,102 @@ def pick_page_from_context(context, target_url: str, use_existing_page: bool) ->
     return context.new_page()
 
 
+def inline_iframe_code_embeds(page: Page, article_html: str, retries: int, debug_embeds: bool = False) -> str:
+    """Resolve code embeds rendered inside iframes into inline <pre><code> blocks.
+
+    Medium often stores GitHub/Gist snippets as iframes (medium.com/media/*).
+    If we drop iframes before markdown conversion, code gets lost. This helper
+    opens each iframe URL with Playwright (JS-rendered) and inlines extracted code.
+    """
+    soup = BeautifulSoup(article_html, "html.parser")
+    iframes = soup.find_all("iframe")
+    if not iframes:
+        return article_html
+
+    total = len(iframes)
+    if debug_embeds:
+        print(f"[embed] found {total} iframe(s) in article", file=sys.stderr)
+
+    for idx, iframe in enumerate(iframes, start=1):
+        raw_src = iframe.get("src")
+        if not raw_src:
+            if debug_embeds:
+                print(f"[embed {idx}/{total}] skip: missing src", file=sys.stderr)
+            continue
+
+        src = urljoin(page.url, raw_src)
+        title = (iframe.get("title") or "").strip()
+        embed_code = ""
+        attempts = 0
+        last_error = ""
+        display_title = title if title else "(untitled)"
+
+        for i in range(retries + 1):
+            attempts += 1
+            embed_page = None
+            try:
+                embed_page = page.context.new_page()
+                embed_page.goto(src, wait_until="domcontentloaded", timeout=25000)
+                embed_page.wait_for_timeout(1200)
+                # Give script-based embeds a chance to render.
+                try:
+                    embed_page.wait_for_selector(
+                        "pre, code, .blob-code, .js-file-line, [data-line-number]",
+                        timeout=3500,
+                    )
+                except Exception:
+                    pass
+                embed_html = embed_page.content()
+                embed_code = extract_embed_code_from_html(embed_html, retries=retries)
+                if embed_code:
+                    break
+            except Exception as e:
+                last_error = f"{type(e).__name__}: {e}"
+                if i == retries:
+                    break
+            finally:
+                if embed_page is not None:
+                    try:
+                        embed_page.close()
+                    except Exception:
+                        pass
+                if not embed_code and i < retries:
+                    time.sleep(min(4, 1.2 * (2**i)))
+
+        if not embed_code:
+            if debug_embeds:
+                reason = last_error if last_error else "no code nodes found after render"
+                print(
+                    f"[embed {idx}/{total}] failed: title={display_title!r}, src={src}, attempts={attempts}, reason={reason}",
+                    file=sys.stderr,
+                )
+            continue
+
+        if debug_embeds:
+            line_count = len(embed_code.splitlines())
+            print(
+                f"[embed {idx}/{total}] success: title={display_title!r}, src={src}, attempts={attempts}, lines={line_count}",
+                file=sys.stderr,
+            )
+
+        container = soup.new_tag("div")
+        if title:
+            title_tag = soup.new_tag("p")
+            strong = soup.new_tag("strong")
+            strong.string = title
+            title_tag.append(strong)
+            container.append(title_tag)
+
+        pre = soup.new_tag("pre")
+        code = soup.new_tag("code")
+        code.string = embed_code
+        pre.append(code)
+        container.append(pre)
+        iframe.replace_with(container)
+
+    return str(soup)
+
+
 def fetch_article_html(
     url: str,
     navigation_timeout_ms: int,
@@ -509,6 +786,7 @@ def fetch_article_html(
     storage_state_out: Path | None,
     cdp_url: str | None,
     use_existing_page: bool,
+    debug_embeds: bool = False,
 ) -> Tuple[str, str, str]:
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(cdp_url) if cdp_url else p.chromium.launch(headless=headless)
@@ -559,6 +837,9 @@ def fetch_article_html(
                 "Current tab is still on Cloudflare verification page. "
                 "Please complete verification in that Chrome window, ensure article is visible, then rerun."
             )
+        else:
+            # Even with --use-existing-page, ensure lazy embeds/code cards are loaded.
+            hydrate_page_content(page, idle_timeout_ms=idle_timeout_ms)
 
         title = ""
         for selector in [
@@ -593,6 +874,18 @@ def fetch_article_html(
                 except Exception:
                     pass
 
+        if article_html.strip():
+            try:
+                article_html = inline_iframe_code_embeds(
+                    page,
+                    article_html,
+                    retries=max(0, retries),
+                    debug_embeds=debug_embeds,
+                )
+            except Exception:
+                # Keep original article content if embed expansion fails.
+                pass
+
         full_html = page.content()
         if storage_state_out and not cdp_url:
             context.storage_state(path=str(storage_state_out))
@@ -620,6 +913,7 @@ def save_markdown(
     use_existing_page: bool,
     export_html: bool,
     code_mode: str,
+    debug_embeds: bool = False,
 ) -> Path:
     title, article_html, _ = fetch_article_html(
         url,
@@ -634,6 +928,7 @@ def save_markdown(
         storage_state_out=storage_state_out,
         cdp_url=cdp_url,
         use_existing_page=use_existing_page,
+        debug_embeds=debug_embeds,
     )
 
     safe_slug = slugify(filename if filename else title)
@@ -644,7 +939,12 @@ def save_markdown(
     download_images(soup, url, assets_dir, retries=retries)
     html_content = str(soup)
 
-    body_md = to_markdown(html_content, code_mode=code_mode)
+    body_md = to_markdown(
+        html_content,
+        code_mode=code_mode,
+        page_url=url,
+        retries=retries,
+    )
     final_md = f"# {title}\n\n来源: {url}\n\n{body_md}\n"
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -724,6 +1024,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show browser window (disable headless mode)",
     )
+    parser.add_argument(
+        "--debug-embeds",
+        action="store_true",
+        help="Print debug logs for iframe code embeds: success/failure, attempts, and extracted line count.",
+    )
     return parser.parse_args()
 
 
@@ -751,6 +1056,7 @@ def main() -> None:
         use_existing_page=bool(args.use_existing_page),
         export_html=bool(args.export_html),
         code_mode=args.code_mode,
+        debug_embeds=bool(args.debug_embeds),
     )
     print(f"Saved: {md_path}")
 
