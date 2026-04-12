@@ -38,6 +38,18 @@ def sanitize_filename(name: str) -> str:
     return name.strip("._") or "image"
 
 
+def canonical_page_url(raw: str) -> str:
+    """Normalize URL for tab matching (ignore query/fragment/trailing slash)."""
+    try:
+        p = urlparse(raw or "")
+    except Exception:
+        return ""
+    scheme = p.scheme or "https"
+    host = (p.netloc or "").lower()
+    path = (p.path or "/").rstrip("/") or "/"
+    return f"{scheme}://{host}{path}"
+
+
 def extract_extension(url: str, content_type: str | None) -> str:
     parsed = urlparse(url)
     suffix = Path(parsed.path).suffix
@@ -166,6 +178,23 @@ def wait_for_manual_verification(page: Page, timeout_ms: int) -> bool:
             return True
         page.wait_for_timeout(1000)
     return not looks_like_bot_challenge(page)
+
+
+def looks_like_member_preview(page: Page) -> bool:
+    """Detect Medium paywalled preview state (partial content only)."""
+    markers = [
+        "Member-only story",
+        "The rest of this story is for members only",
+        "Become a member",
+        "Get unlimited access",
+        "Already a member?",
+        "Upgrade to Medium",
+    ]
+    try:
+        body = page.inner_text("body")[:24000]
+    except Exception:
+        body = ""
+    return any(m in body for m in markers)
 
 
 def fetch_with_retries(url: str, retries: int, timeout_s: int = 30) -> requests.Response | None:
@@ -662,9 +691,48 @@ def hydrate_page_content(page: Page, idle_timeout_ms: int) -> None:
     dismiss_medium_popups(page)
 
 
+def expand_collapsed_content(page: Page) -> None:
+    """Best-effort click on content expanders before extraction."""
+    selectors = [
+        "button:has-text('Read more')",
+        "button:has-text('Show more')",
+        "button:has-text('See more')",
+        "button:has-text('Continue reading')",
+        "button:has-text('View more')",
+        "a:has-text('Read more')",
+        "a:has-text('Continue reading')",
+        "[role='button']:has-text('Read more')",
+        "[role='button']:has-text('Show more')",
+    ]
+    for _ in range(3):
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                n = min(loc.count(), 8)
+                for i in range(n):
+                    item = loc.nth(i)
+                    if item.is_visible():
+                        item.click(timeout=800)
+                        page.wait_for_timeout(180)
+            except Exception:
+                pass
+
+
 def pick_page_from_context(context, target_url: str, use_existing_page: bool) -> Page:
     pages = context.pages
     if use_existing_page and pages:
+        target_canon = canonical_page_url(target_url)
+
+        # Prefer exact article-tab match.
+        for p in reversed(pages):
+            try:
+                purl = p.url or ""
+            except Exception:
+                purl = ""
+            if canonical_page_url(purl) == target_canon:
+                return p
+
+        # Fallback: same host.
         host = urlparse(target_url).hostname or ""
         for p in reversed(pages):
             try:
@@ -786,6 +854,7 @@ def fetch_article_html(
     storage_state_out: Path | None,
     cdp_url: str | None,
     use_existing_page: bool,
+    fail_on_member_preview: bool,
     debug_embeds: bool = False,
 ) -> Tuple[str, str, str]:
     with sync_playwright() as p:
@@ -832,6 +901,15 @@ def fetch_article_html(
                 manual_verify_timeout_ms=manual_verify_timeout_ms,
                 retries=retries,
             )
+        elif canonical_page_url(page.url or "") != canonical_page_url(url):
+            load_page_with_retries(
+                page,
+                url=url,
+                navigation_timeout_ms=navigation_timeout_ms,
+                idle_timeout_ms=idle_timeout_ms,
+                manual_verify_timeout_ms=manual_verify_timeout_ms,
+                retries=retries,
+            )
         elif looks_like_bot_challenge(page):
             raise RuntimeError(
                 "Current tab is still on Cloudflare verification page. "
@@ -840,6 +918,19 @@ def fetch_article_html(
         else:
             # Even with --use-existing-page, ensure lazy embeds/code cards are loaded.
             hydrate_page_content(page, idle_timeout_ms=idle_timeout_ms)
+
+        expand_collapsed_content(page)
+        hydrate_page_content(page, idle_timeout_ms=idle_timeout_ms)
+
+        if looks_like_member_preview(page):
+            msg = (
+                "Detected Medium member-only/preview signals. "
+                "You may be logged in but still lack full access for this story. "
+                "Export will include only currently visible content."
+            )
+            if fail_on_member_preview:
+                raise RuntimeError(msg)
+            print(f"[warn] {msg}", file=sys.stderr)
 
         title = ""
         for selector in [
@@ -911,6 +1002,7 @@ def save_markdown(
     storage_state_out: Path | None,
     cdp_url: str | None,
     use_existing_page: bool,
+    fail_on_member_preview: bool,
     export_html: bool,
     code_mode: str,
     debug_embeds: bool = False,
@@ -928,6 +1020,7 @@ def save_markdown(
         storage_state_out=storage_state_out,
         cdp_url=cdp_url,
         use_existing_page=use_existing_page,
+        fail_on_member_preview=fail_on_member_preview,
         debug_embeds=debug_embeds,
     )
 
@@ -1020,6 +1113,11 @@ def parse_args() -> argparse.Namespace:
         help="Code block rendering mode in markdown: fenced (default) or html.",
     )
     parser.add_argument(
+        "--fail-on-member-preview",
+        action="store_true",
+        help="Fail fast when page appears to be Medium member-only preview/paywall state.",
+    )
+    parser.add_argument(
         "--show-browser",
         action="store_true",
         help="Show browser window (disable headless mode)",
@@ -1054,6 +1152,7 @@ def main() -> None:
         storage_state_out=storage_state_out,
         cdp_url=args.cdp_url,
         use_existing_page=bool(args.use_existing_page),
+        fail_on_member_preview=bool(args.fail_on_member_preview),
         export_html=bool(args.export_html),
         code_mode=args.code_mode,
         debug_embeds=bool(args.debug_embeds),
