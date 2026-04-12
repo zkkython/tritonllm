@@ -17,7 +17,7 @@ venv/
 
 # Scraping/export artifacts
 exports/
-docs/image/
+
 
 # Session / credential-like local files
 medium_state.json
