@@ -13,7 +13,7 @@
 
 > 这是 Triton 系列第二篇。若你不熟悉 Triton 与 GPU 基础，建议先读上一篇向量加法。原作者完整代码：[https://github.com/RPegoud/Triton-Kernels](https://github.com/RPegoud/Triton-Kernels)
 
-![](Triton_逐Kernel学习_矩阵乘法_assets/img_3_14cddc4dad2e.gif)
+![](image/Triton内核开发基础-矩阵乘法/img_3_14cddc4dad2e.gif)
 
 *本文目标：实现并理解并行分块 GEMM（Parallel Tiled GEMM）。*
 
@@ -45,7 +45,7 @@ for i in range(M):
 
 这个实现好理解，但访存效率很差。因为每处理 `X` 的一行，都要重复加载 `Y` 的所有列，导致大量冗余加载。
 
-![](Triton_逐Kernel学习_矩阵乘法_assets/img_4_57e2b56e4c8e.gif)
+![](image/Triton内核开发基础-矩阵乘法/img_4_57e2b56e4c8e.gif)
 
 *朴素矩阵乘法：每一步的向量点积都在重复取数。*
 
@@ -68,7 +68,7 @@ for i in range(M):
 
 你可以把点积分段累加，也可以二维扩展，一次计算 `Z` 的 `(2,2)` 子块并在共享维上累加。
 
-![](Triton_逐Kernel学习_矩阵乘法_assets/img_5_865fba833650.gif)
+![](image/Triton内核开发基础-矩阵乘法/img_5_865fba833650.gif)
 
 *分块后，同一批加载数据可复用多次。*
 
@@ -83,7 +83,7 @@ for i in range(M):
 - **L2 Cache**：全 SM 共享缓存，容量更大。
 - **HBM**：容量最大，延迟也最高。
 
-![](Triton_逐Kernel学习_矩阵乘法_assets/img_6_b68811099aee.png)
+![](image/Triton内核开发基础-矩阵乘法/img_6_b68811099aee.png)
 
 *越靠上越快越小，越靠下越慢越大。*
 
@@ -98,7 +98,7 @@ for i in range(M):
 
 在分块基础上，进一步把不同 tile 的计算分发给多个线程块并行执行。
 
-![](Triton_逐Kernel学习_矩阵乘法_assets/img_7_3092189daaa7.gif)
+![](image/Triton内核开发基础-矩阵乘法/img_7_3092189daaa7.gif)
 
 *把“迭代 tile”改成“并行 tile”。*
 
@@ -111,7 +111,7 @@ for i in range(M):
 - 行内元素连续
 - 列访问通常跨步
 
-![](Triton_逐Kernel学习_矩阵乘法_assets/img_8_c8a216562a84.png)
+![](image/Triton内核开发基础-矩阵乘法/img_8_c8a216562a84.png)
 
 GEMM 需要访问 `Y` 的列，所以常见做法是：
 
@@ -122,7 +122,7 @@ GEMM 需要访问 `Y` 的列，所以常见做法是：
 
 在 kernel 内部再把 block 逻辑上转回：`z_block = tl.dot(X_block, Y_block.T)`。
 
-![](Triton_逐Kernel学习_矩阵乘法_assets/img_9_7ba00bf6db0f.png)
+![](image/Triton内核开发基础-矩阵乘法/img_9_7ba00bf6db0f.png)
 
 *`Y`、`Y.T`、`Y.T.contiguous()` 在内存语义上的区别。*
 

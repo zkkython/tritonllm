@@ -10,7 +10,7 @@
 
 CUDA 全称 **Compute Unified Device Architecture**。简单说，它是让你能把代码跑在 GPU 上，而不是 CPU 上的一套平台/编程模型。它由 Nvidia 提供，所以只支持 Nvidia 显卡。很多人说“GPU 编程”，默认其实就是在说 CUDA。
 
-![](CUDA20个核心概念通俗讲解_assets/img_2_df917347a7c1.avif)
+![](image/CUDA20个核心概念通俗讲解/img_2_df917347a7c1.avif)
 
 把 CUDA 理解成“你和 GPU 沟通的语言”更直观。没有它，GPU 就只是昂贵但闲着的硬件。
 
@@ -56,7 +56,7 @@ grid 是一次 kernel 启动的“全部 block 集合”。
 
 结构是：`grid -> blocks -> threads`。
 
-![](CUDA20个核心概念通俗讲解_assets/img_3_5db931593cdb.png)
+![](image/CUDA20个核心概念通俗讲解/img_3_5db931593cdb.png)
 
 可以类比成：城市（grid）- 街区（block）- 住户（thread）。
 
@@ -75,7 +75,7 @@ grid 是一次 kernel 启动的“全部 block 集合”。
 
 GPU 有自己的显存，与 CPU 的内存（RAM）分离。
 
-![](CUDA20个核心概念通俗讲解_assets/img_4_0e16eeceaa8b.png)
+![](image/CUDA20个核心概念通俗讲解/img_4_0e16eeceaa8b.png)
 
 数据通常要先从 host memory 拷到 device memory，GPU 才能处理。处理完再拷回去。很多“GPU 代码不快”的根因都在这一步。
 
@@ -105,7 +105,7 @@ GPU 调度线程时，不是一个一个线程调度，而是按 32 个线程一
 
 同一个 warp 的线程通常“锁步执行”。这也是为什么 GPU 上大量分支（`if/else`）会伤性能：如果 warp 内线程走不同分支，硬件往往要分路径串行执行。
 
-![](CUDA20个核心概念通俗讲解_assets/img_5_70d7e1621d0c.png)
+![](image/CUDA20个核心概念通俗讲解/img_5_70d7e1621d0c.png)
 
 这也是 PyTorch 更鼓励向量化张量操作、少写 Python 循环的原因之一。
 
@@ -159,7 +159,7 @@ CPU 与 GPU 之间搬数据很贵。
 
 GPU 的价值在于真并行：大量线程同时执行。
 
-![](CUDA20个核心概念通俗讲解_assets/img_6_dd34f3565bda.png)
+![](image/CUDA20个核心概念通俗讲解/img_6_dd34f3565bda.png)
 
 ## 16. CUDA Streams
 
