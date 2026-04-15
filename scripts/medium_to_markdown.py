@@ -1132,13 +1132,18 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    url = (args.url or "").strip()
+    if not url or not re.match(r"^https?://", url):
+        raise ValueError(
+            "Invalid URL. Please pass a full http(s) article URL as the first argument."
+        )
     out_dir = Path(args.out_dir)
     cookie_file = Path(args.cookie_file) if args.cookie_file else None
     cookie_kv = parse_cookie_kv(args.cookie)
     storage_state_in = Path(args.storage_state_in) if args.storage_state_in else None
     storage_state_out = Path(args.storage_state_out) if args.storage_state_out else None
     md_path = save_markdown(
-        url=args.url,
+        url=url,
         out_dir=out_dir,
         filename=args.filename,
         navigation_timeout_ms=args.timeout_ms,
